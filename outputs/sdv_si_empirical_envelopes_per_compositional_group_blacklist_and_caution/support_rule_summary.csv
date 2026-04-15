@@ -1,0 +1,2 @@
+zip_count_input,support_rule,group_sheet_used,stable_total_loss_frac_max,stable_total_loss_pct_max,stable_max_year_loss_frac_max,stable_max_year_loss_pct_max,n_support_subparcels,support_area_ha,scene_filter_mode,zip_count_used
+60,relative loss thresholds,LOSS_CAUSES,0.005,0.5,0.003,0.3,145,1411.1,blacklist_and_caution,41
