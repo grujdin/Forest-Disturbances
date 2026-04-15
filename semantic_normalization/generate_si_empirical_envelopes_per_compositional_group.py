@@ -68,7 +68,7 @@ MIN_DATES_PER_BIN_FOR_PLOT = 1
 
 # Scene-quality controls
 COMPUTE_SCENE_QUALITY = True
-SCENE_FILTER_MODE = "blacklist_and_caution" # Options: "none", "blacklist", "blacklist_and_caution"
+SCENE_FILTER_MODE = "none" # Options: "none", "blacklist", "blacklist_and_caution"
 
 # Recommendation thresholds
 BLACKLIST_CLEAR_FRAC_MAX = 0.10
@@ -88,6 +88,14 @@ PLOTS_DIRNAME = "plots"
 WRITE_INTERMEDIATE = True
 VERBOSE = True
 MAKE_PLOTS = True
+
+# Plot styling for date-level points
+COLOR_POINTS_BY_YEAR = True
+CONNECT_POINTS_WITHIN_YEAR = False
+YEAR_COLORMAP = "tab20"
+SCATTER_SIZE = 24
+SCATTER_ALPHA = 0.85
+YEAR_LINEWIDTH = 0.9
 
 # =============================================================================
 # Helpers
@@ -668,7 +676,46 @@ def main():
             ax.plot(x, cmax, linestyle='--', linewidth=1.3, label='Max of date medians')
             pts = date_df[(date_df['group_code'] == group_code) & (date_df['index'] == index_name)].copy()
             if not pts.empty:
-                ax.scatter(pts['doy'], pts['date_median'], s=20, alpha=0.75, label='Date medians')
+                pts = pts.copy()
+                pts['date'] = pd.to_datetime(pts['date'], errors='coerce')
+                pts = pts[pts['date'].notna()].copy()
+                pts['year'] = pts['date'].dt.year.astype(int)
+
+                if COLOR_POINTS_BY_YEAR:
+                    years = sorted(pts['year'].dropna().unique().tolist())
+                    cmap = plt.get_cmap(YEAR_COLORMAP, max(len(years), 1))
+                    year_to_color = {yr: cmap(i) for i, yr in enumerate(years)}
+
+                    for i, yr in enumerate(years):
+                        ysub = pts[pts['year'] == yr].sort_values('doy')
+                        color = year_to_color[yr]
+                        ax.scatter(
+                            ysub['doy'],
+                            ysub['date_median'],
+                            s=SCATTER_SIZE,
+                            alpha=SCATTER_ALPHA,
+                            color=color,
+                            label=f'{yr} date medians'
+                        )
+                        if CONNECT_POINTS_WITHIN_YEAR and len(ysub) >= 2:
+                            ax.plot(
+                                ysub['doy'],
+                                ysub['date_median'],
+                                linestyle=':',
+                                linewidth=YEAR_LINEWIDTH,
+                                alpha=min(SCATTER_ALPHA + 0.05, 1.0),
+                                color=color,
+                                label='_nolegend_'
+                            )
+                else:
+                    ax.scatter(
+                        pts['doy'],
+                        pts['date_median'],
+                        s=SCATTER_SIZE,
+                        alpha=SCATTER_ALPHA,
+                        label='Date medians'
+                    )
+
             ax.set_xlim(1, 365)
             ax.set_xticks([1, 60, 120, 180, 240, 300, 365])
             ax.set_xlabel('DOY')
