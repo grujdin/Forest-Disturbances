@@ -68,7 +68,7 @@ MIN_DATES_PER_BIN_FOR_PLOT = 1
 
 # Scene-quality controls
 COMPUTE_SCENE_QUALITY = True
-AUTO_SKIP_BLACKLISTED_SCENES = True #default, False
+SCENE_FILTER_MODE = "blacklist_and_caution" # Options: "none", "blacklist", "blacklist_and_caution"
 
 # Recommendation thresholds
 BLACKLIST_CLEAR_FRAC_MAX = 0.10
@@ -454,7 +454,7 @@ def main():
         'stable_max_year_loss_pct_max': STABLE_MAX_YEAR_LOSS_FRAC_MAX * 100.0,
         'n_support_subparcels': len(group_gdf),
         'support_area_ha': float(pd.to_numeric(group_gdf[AREA_HA_FIELD], errors='coerce').fillna(0).sum()),
-        'auto_skip_blacklisted_scenes': AUTO_SKIP_BLACKLISTED_SCENES,
+        'scene_filter_mode': SCENE_FILTER_MODE,
     }])
     support_summary.to_csv(OUTPUT_DIR / 'support_rule_summary.csv', index=False)
 
@@ -533,10 +533,25 @@ def main():
         n_caut = int((rec_df["recommendation"] == "caution").sum())
         log(f"Scene-quality scan done: {n_black} blacklist, {n_caut} caution, {len(rec_df)-n_black-n_caut} keep")
 
-    if AUTO_SKIP_BLACKLISTED_SCENES and not rec_df.empty:
-        blacklist = set(rec_df.loc[rec_df["recommendation"] == "blacklist", "scene"].astype(str))
-        scan_records = [rec for rec in scan_records if rec[0].name not in blacklist]
-        log(f"After skipping blacklist: {len(scan_records)} scenes remain")
+    if not rec_df.empty and SCENE_FILTER_MODE != "none":
+        if SCENE_FILTER_MODE == "blacklist":
+            skip_labels = {"blacklist"}
+        elif SCENE_FILTER_MODE == "blacklist_and_caution":
+            skip_labels = {"blacklist", "caution"}
+        else:
+            raise ValueError(
+                f"Unsupported SCENE_FILTER_MODE={SCENE_FILTER_MODE!r}. "
+                "Use 'none', 'blacklist', or 'blacklist_and_caution'."
+            )
+
+        skip_scenes = set(
+            rec_df.loc[rec_df["recommendation"].isin(skip_labels), "scene"].astype(str)
+        )
+        scan_records = [rec for rec in scan_records if rec[0].name not in skip_scenes]
+        log(
+            f"After scene filtering mode '{SCENE_FILTER_MODE}' "
+            f"({', '.join(sorted(skip_labels))}): {len(scan_records)} scenes remain"
+        )
 
     date_rows = []
     for i_scene, (zip_path, members, bands, data_mask, clear_mask) in enumerate(scan_records, start=1):
