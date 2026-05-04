@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 import time
 from datetime import datetime
+import warnings
 
 import geopandas as gpd
 import matplotlib
@@ -34,10 +35,10 @@ from rasterio.warp import Resampling, reproject
 # HARD-CODED CONFIG
 # =============================================================================
 
-ZIP_GLOB = "D:/Forest_Disturbance/imagery_zip/Stana_de_Vale_BH/SdV_*.zip"
-ZIP_FILES = sorted(Path("D:/Forest_Disturbance/imagery_zip/Stana_de_Vale_BH").glob("SdV_*.zip"))
+ZIP_GLOB = "D:/Forest_Disturbance/imagery_zip/Stana_de_Vale_S2/SdV_*.zip"
+ZIP_FILES = sorted(Path("D:/Forest_Disturbance/imagery_zip/Stana_de_Vale_S2").glob("SdV_*.zip"))
 
-FMU_GEOJSON = Path("D:/Forest_Disturbance/tables/SdV_FMU.geojson")
+FMU_GEOJSON = Path("D:/Forest_Disturbance/vector_data/SdV_FMU.geojson")
 GROUP_WORKBOOK = Path("D:/Forest_Disturbance/tables/sdv_compos_groups_loss_causes_reference.xlsx")
 GROUP_SHEET = "LOSS_CAUSES"
 
@@ -68,7 +69,7 @@ MIN_DATES_PER_BIN_FOR_PLOT = 1
 
 # Scene-quality controls
 COMPUTE_SCENE_QUALITY = True
-SCENE_FILTER_MODE = "none" # Options: "none", "blacklist", "blacklist_and_caution"
+SCENE_FILTER_MODE = "blacklist_and_caution" # Options: "none", "blacklist", "blacklist_and_caution"
 
 # Recommendation thresholds
 BLACKLIST_CLEAR_FRAC_MAX = 0.10
@@ -83,7 +84,7 @@ CAUTION_SHADOW_FRAC_MIN = 0.30
 CAUTION_SCL7_FRAC_MIN = 0.10
 CAUTION_NDSI_MED_MIN = 0.00
 
-OUTPUT_DIR = Path("D:/Forest_Disturbance/outputs/sdv_si_empirical_envelopes_per_compositional_group")
+OUTPUT_DIR = Path("D:/Forest_Disturbance/outputs/sdv_si_empirical_envelopes_per_compositional_group_blacklist_and_caution")
 PLOTS_DIRNAME = "plots"
 WRITE_INTERMEDIATE = True
 VERBOSE = True
@@ -373,6 +374,102 @@ def summarize_support(group_gdf: gpd.GeoDataFrame) -> pd.DataFrame:
         .rename(columns={GROUP_CODE_FIELD: 'group_code', GROUP_LABEL_FIELD: 'group_label'})
     )
 
+
+def _norm_codes(values) -> List[str]:
+    out = []
+    for v in values:
+        if pd.isna(v):
+            continue
+        s = str(v).strip()
+        if s and s.lower() != "nan":
+            out.append(s)
+    return sorted(set(out))
+
+def emit_group_code_checks(
+    workbook_attrs: pd.DataFrame,
+    support_group_gdf: gpd.GeoDataFrame,
+    group_table: pd.DataFrame,
+    env_df: pd.DataFrame,
+    outdir: Path,
+) -> None:
+    """
+    Print and save diagnostics comparing workbook group codes with generated envelope codes.
+
+    Notes
+    -----
+    - workbook_non_excluded_codes: all workbook codes except explicitly excluded ones.
+    - support_group_codes: codes that survived the stable-support filtering and rasterization path.
+    - envelope_group_codes: codes actually present in the generated doy_bin_envelopes.csv.
+    The strictest and most relevant consistency check is support_group_codes vs envelope_group_codes.
+    """
+    workbook_raw_codes = _norm_codes(workbook_attrs.get(GROUP_CODE_FIELD, pd.Series(dtype=object)))
+    workbook_non_excluded_codes = [c for c in workbook_raw_codes if c not in EXCLUDE_GROUP_CODES]
+    support_group_codes = _norm_codes(support_group_gdf.get(GROUP_CODE_FIELD, pd.Series(dtype=object)))
+    raster_group_codes = _norm_codes(group_table.get(GROUP_CODE_FIELD, pd.Series(dtype=object)))
+    envelope_group_codes = _norm_codes(env_df.get("group_code", pd.Series(dtype=object)))
+
+    workbook_not_used_after_filters = [c for c in workbook_non_excluded_codes if c not in support_group_codes]
+    missing_in_envelopes = [c for c in support_group_codes if c not in envelope_group_codes]
+    extra_in_envelopes = [c for c in envelope_group_codes if c not in support_group_codes]
+
+    log(f"Workbook group codes (raw): {workbook_raw_codes}")
+    log(f"Workbook group codes (non-excluded): {workbook_non_excluded_codes}")
+    log(f"Support group codes after stable/exclusion filters: {support_group_codes}")
+    log(f"Rasterized group codes: {raster_group_codes}")
+    log(f"Generated envelope group codes: {envelope_group_codes}")
+
+    if workbook_not_used_after_filters:
+        log(
+            "Info: workbook codes present before filtering but not used after stable/exclusion filters: "
+            + ", ".join(workbook_not_used_after_filters)
+        )
+
+    report_rows = []
+    all_codes = sorted(set(workbook_raw_codes) | set(workbook_non_excluded_codes) | set(support_group_codes) | set(envelope_group_codes))
+    for code in all_codes:
+        report_rows.append({
+            "group_code": code,
+            "in_workbook_raw": code in workbook_raw_codes,
+            "in_workbook_non_excluded": code in workbook_non_excluded_codes,
+            "in_support_after_filters": code in support_group_codes,
+            "in_raster_group_table": code in raster_group_codes,
+            "in_generated_envelopes": code in envelope_group_codes,
+        })
+    pd.DataFrame(report_rows).to_csv(outdir / "group_code_check_report.csv", index=False)
+
+    summary_lines = [
+        f"Workbook group codes (raw): {', '.join(workbook_raw_codes) if workbook_raw_codes else '(none)'}",
+        f"Workbook group codes (non-excluded): {', '.join(workbook_non_excluded_codes) if workbook_non_excluded_codes else '(none)'}",
+        f"Support group codes after stable/exclusion filters: {', '.join(support_group_codes) if support_group_codes else '(none)'}",
+        f"Rasterized group codes: {', '.join(raster_group_codes) if raster_group_codes else '(none)'}",
+        f"Generated envelope group codes: {', '.join(envelope_group_codes) if envelope_group_codes else '(none)'}",
+    ]
+
+    if missing_in_envelopes:
+        msg = (
+            "WARNING: some support group codes survived filtering but are missing from generated envelopes: "
+            + ", ".join(missing_in_envelopes)
+            + ". This usually means that those groups did not accumulate enough valid pixels/dates after scene filtering."
+        )
+        warnings.warn(msg)
+        log(msg)
+        summary_lines.append(msg)
+    else:
+        ok_msg = "Support group codes and generated envelope group codes match."
+        log(ok_msg)
+        summary_lines.append(ok_msg)
+
+    if extra_in_envelopes:
+        msg = (
+            "WARNING: some group codes appear in generated envelopes but not in the filtered support groups: "
+            + ", ".join(extra_in_envelopes)
+        )
+        warnings.warn(msg)
+        log(msg)
+        summary_lines.append(msg)
+
+    (outdir / "group_code_check_summary.txt").write_text("\n".join(summary_lines), encoding="utf-8")
+
 def scene_quality_recommendation(row: pd.Series) -> Tuple[str, str]:
     reasons = []
     clear_frac = float(row.get("clear_frac", np.nan))
@@ -444,6 +541,9 @@ def main():
     first_members = zip_members_by_tag(ZIP_FILES[0])
     _, ref_profile, _ = read_single_band(ZIP_FILES[0], first_members['B04'])
 
+    sheet_used = resolve_group_sheet(GROUP_WORKBOOK, GROUP_SHEET)
+    workbook_attrs_raw = pd.read_excel(GROUP_WORKBOOK, sheet_name=sheet_used)
+
     group_gdf = load_grouped_subparcels()
     if len(group_gdf) == 0:
         raise RuntimeError('No grouped subparcels remained after the healthy-support filter.')
@@ -455,7 +555,7 @@ def main():
     support_summary = pd.DataFrame([{
         'zip_count_input': len(ZIP_FILES),
         'support_rule': 'relative loss thresholds',
-        'group_sheet_used': resolve_group_sheet(GROUP_WORKBOOK, GROUP_SHEET),
+        'group_sheet_used': sheet_used,
         'stable_total_loss_frac_max': STABLE_TOTAL_LOSS_FRAC_MAX,
         'stable_total_loss_pct_max': STABLE_TOTAL_LOSS_FRAC_MAX * 100.0,
         'stable_max_year_loss_frac_max': STABLE_MAX_YEAR_LOSS_FRAC_MAX,
@@ -644,6 +744,7 @@ def main():
         })
     env_df = pd.DataFrame(env_rows).sort_values(['group_code', 'index', 'doy_bin_center']).reset_index(drop=True)
     env_df.to_csv(OUTPUT_DIR / 'doy_bin_envelopes.csv', index=False)
+    emit_group_code_checks(workbook_attrs_raw, group_gdf, group_table, env_df, OUTPUT_DIR)
 
     coverage_df = (
         date_df.groupby(['group_code', 'index'])
