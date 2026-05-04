@@ -38,7 +38,7 @@ import io
 import re
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set
 
 import geopandas as gpd
 import numpy as np
@@ -51,12 +51,27 @@ from rasterio.warp import Resampling, reproject
 # HARD-CODED CONFIG
 # =============================================================================
 
-# Best available empirical envelopes: the user's local run with all available EO Browser ZIPs.
-ENVELOPE_SOURCE = Path("D:/Forest_Disturbance/outputs/sdv_si_empirical_envelopes_per_compositional_group_blacklist_and_caution.zip")
-ENVELOPE_CSV_IN_ZIP = "sdv_si_empirical_envelopes_per_compositional_group_blacklist_and_caution/doy_bin_envelopes.csv"
+# Selected empirical-envelope run. The same scene-quality policy used to build the
+# envelope library is also used below to select target scenes for semantic-mask
+# production. This prevents winter/snow/caution scenes that did not contribute to
+# the selected envelope library from being reintroduced during mask application.
+# Supported values: "none", "blacklist", "blacklist_and_caution".
+ENVELOPE_RUN = "blacklist_and_caution"
+ENVELOPE_OUTPUT_ROOT = Path("D:/Forest_Disturbance/outputs")
+ENVELOPE_RUN_DIRNAME = f"sdv_si_empirical_envelopes_per_compositional_group_{ENVELOPE_RUN}"
+ENVELOPE_SOURCE = ENVELOPE_OUTPUT_ROOT / f"{ENVELOPE_RUN_DIRNAME}.zip"
+ENVELOPE_CSV_IN_ZIP = f"{ENVELOPE_RUN_DIRNAME}/doy_bin_envelopes.csv"
+SCENE_RECOMMENDATION_CSV_IN_ZIP = f"{ENVELOPE_RUN_DIRNAME}/scene_blacklist_recommendation.csv"
 
-TARGET_ZIP_GLOB = "D:/Forest_Disturbance/imagery_zip/Stana_de_Vale_BH/SdV_*.zip"
-TARGET_ZIPS = sorted(Path("D:/Forest_Disturbance/imagery_zip/Stana_de_Vale_BH").glob("SdV_*.zip"))
+TARGET_ZIP_GLOB = "D:/Forest_Disturbance/imagery_zip/Stana_de_Vale_S2/SdV_*.zip"
+TARGET_ZIPS_ALL = sorted(Path("D:/Forest_Disturbance/imagery_zip/Stana_de_Vale_S2").glob("SdV_*.zip"))
+
+# If True, only scenes that were eligible for the selected envelope run are
+# processed. For ENVELOPE_RUN="blacklist_and_caution", this means recommendation
+# == "keep" only. For ENVELOPE_RUN="blacklist", this means keep + caution. For
+# ENVELOPE_RUN="none", all recommendation classes are accepted.
+FILTER_TARGET_SCENES_TO_ENVELOPE_POLICY = True
+EXCLUDE_SCENES_WITHOUT_RECOMMENDATION = True
 
 FMU_GEOJSON = Path("D:/Forest_Disturbance/vector_data/SdV_FMU.geojson")
 GROUP_WORKBOOK = Path("D:/Forest_Disturbance/tables/sdv_compos_groups_loss_causes_reference.xlsx")
@@ -84,14 +99,14 @@ KEEP_VOTES_REQUIRED = 2
 # when a bin is supported by only one or a few dates.
 ENVELOPE_LOW_COL = "median_of_date_q10"
 ENVELOPE_HIGH_COL = "median_of_date_q90"
-USE_NEAREST_BIN_FALLBACK = True
+USE_NEAREST_BIN_FALLBACK = False
 
 USE_SCL_IF_AVAILABLE = True
 SCL_EXCLUDE_CLASSES = {0, 1, 2, 3, 8, 9, 10, 11}
 ALLOW_UNKNOWN_SCL_COLORS = False
 
 WRITE_INDEX_INSIDE_MASKS = False
-OUTPUT_DIR = Path("D:/Forest_Disturbance/outputs/semantic_masks_empirical_envelopes_blacklist_and_caution")
+OUTPUT_DIR = Path(f"D:/Forest_Disturbance/outputs/semantic_masks_empirical_envelopes_{ENVELOPE_RUN}_eligible")
 
 # =============================================================================
 # Helpers
@@ -404,6 +419,85 @@ def load_envelopes() -> pd.DataFrame:
     return env
 
 
+def allowed_recommendations_for_envelope_run(run: str) -> Set[str]:
+    """Return scene-quality classes that contributed to the selected envelope run.
+
+    The scene_blacklist_recommendation.csv file produced during envelope
+    construction uses three classes: keep, caution, and blacklist. The selected
+    envelope run determines which classes contributed to the empirical envelopes;
+    the same set is used here when generating semantic masks for change detection.
+    """
+    run = run.lower().strip()
+    if run == "none":
+        return {"keep", "caution", "blacklist"}
+    if run == "blacklist":
+        return {"keep", "caution"}
+    if run == "blacklist_and_caution":
+        return {"keep"}
+    raise ValueError(f"Unsupported ENVELOPE_RUN: {run!r}")
+
+
+def load_scene_recommendations() -> pd.DataFrame:
+    """Load scene_blacklist_recommendation.csv from the selected envelope run."""
+    if ENVELOPE_SOURCE.suffix.lower() == ".zip":
+        with zipfile.ZipFile(ENVELOPE_SOURCE, "r") as zf:
+            with zf.open(SCENE_RECOMMENDATION_CSV_IN_ZIP) as f:
+                rec = pd.read_csv(io.BytesIO(f.read()))
+    else:
+        source_path = Path(ENVELOPE_SOURCE)
+        if source_path.is_dir():
+            rec_path = source_path / "scene_blacklist_recommendation.csv"
+        else:
+            rec_path = source_path.parent / "scene_blacklist_recommendation.csv"
+        rec = pd.read_csv(rec_path)
+    if "scene" not in rec.columns or "recommendation" not in rec.columns:
+        raise ValueError("scene_blacklist_recommendation.csv must contain 'scene' and 'recommendation' columns")
+    rec = rec.copy()
+    rec["scene_basename"] = rec["scene"].astype(str).map(lambda s: Path(s).name)
+    rec["recommendation"] = rec["recommendation"].astype(str).str.lower().str.strip()
+    rec["date"] = pd.to_datetime(rec["date"], errors="coerce") if "date" in rec.columns else pd.NaT
+    return rec
+
+
+def filter_target_zips_by_recommendation(target_zips: List[Path]) -> Tuple[List[Path], pd.DataFrame]:
+    """Filter target scenes using the same quality policy as the selected envelope run."""
+    if not FILTER_TARGET_SCENES_TO_ENVELOPE_POLICY:
+        return target_zips, pd.DataFrame({
+            "scene": [p.name for p in target_zips],
+            "included": True,
+            "filter_reason": "scene filtering disabled",
+        })
+
+    rec = load_scene_recommendations()
+    allowed = allowed_recommendations_for_envelope_run(ENVELOPE_RUN)
+    rec_by_scene = rec.set_index("scene_basename", drop=False).to_dict("index")
+
+    kept: List[Path] = []
+    log_rows: List[dict] = []
+    for zp in target_zips:
+        scene = zp.name
+        info = rec_by_scene.get(scene)
+        if info is None:
+            include = not EXCLUDE_SCENES_WITHOUT_RECOMMENDATION
+            recommendation = "missing"
+            reason = "not found in scene_blacklist_recommendation.csv"
+        else:
+            recommendation = str(info.get("recommendation", "")).lower().strip()
+            include = recommendation in allowed
+            reason = str(info.get("recommendation_reason", ""))
+        if include:
+            kept.append(zp)
+        log_rows.append({
+            "scene": scene,
+            "recommendation": recommendation,
+            "included": include,
+            "allowed_recommendations": ";".join(sorted(allowed)),
+            "filter_policy": ENVELOPE_RUN,
+            "filter_reason": reason,
+        })
+    return kept, pd.DataFrame(log_rows)
+
+
 def lookup_envelope_rows(env: pd.DataFrame, group_code: str, target_bin_label: str, indices: List[str]) -> Tuple[Dict[str, pd.Series], List[dict]]:
     out = {}
     logs = []
@@ -603,8 +697,16 @@ def process_scene(zip_path: Path, env: pd.DataFrame, polygons: gpd.GeoDataFrame)
 
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    if not TARGET_ZIPS:
+    if not TARGET_ZIPS_ALL:
         raise FileNotFoundError(f"No target ZIPs matched: {TARGET_ZIP_GLOB}")
+
+    target_zips, eligibility_df = filter_target_zips_by_recommendation(TARGET_ZIPS_ALL)
+    eligibility_df.to_csv(OUTPUT_DIR / "scene_eligibility_filter.csv", index=False)
+    if not target_zips:
+        raise RuntimeError(
+            f"Scene filter policy {ENVELOPE_RUN!r} excluded all target scenes. "
+            f"See {OUTPUT_DIR / 'scene_eligibility_filter.csv'}"
+        )
 
     env = load_envelopes()
     polygons = load_grouped_subparcels_all()
@@ -613,7 +715,11 @@ def main() -> None:
     group_rows_all = []
     lookup_rows_all = []
 
-    for zp in TARGET_ZIPS:
+    print(f"Selected envelope run: {ENVELOPE_RUN}")
+    print(f"Target ZIPs before filter: {len(TARGET_ZIPS_ALL)}")
+    print(f"Target ZIPs after filter: {len(target_zips)}")
+
+    for zp in target_zips:
         print(f"Processing {zp.name} ...")
         scene_summary, group_df, lookup_df = process_scene(zp, env, polygons)
         scene_rows.append(scene_summary)
@@ -634,7 +740,9 @@ def main() -> None:
     readme.write_text(
         "Recommended semantic keep/drop masking using empirical group-specific envelopes.\n\n"
         f"Envelope source: {ENVELOPE_SOURCE.name}\n"
-        f"Target ZIP count: {len(TARGET_ZIPS)}\n"
+        f"Target ZIP count before scene filter: {len(TARGET_ZIPS_ALL)}\n"
+        f"Target ZIP count after scene filter: {len(target_zips)}\n"
+        f"Scene filter policy: {ENVELOPE_RUN}; allowed recommendations: {';'.join(sorted(allowed_recommendations_for_envelope_run(ENVELOPE_RUN)))}\n"
         f"Core indices: {', '.join(CORE_INDICES)}\n"
         f"Optional indices (reported only): {', '.join(OPTIONAL_INDICES) if OPTIONAL_INDICES else 'None'}\n"
         f"Keep rule: keep if at least {KEEP_VOTES_REQUIRED} of {len(CORE_INDICES)} core indices fall inside the healthy envelope\n"
